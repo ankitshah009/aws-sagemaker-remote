@@ -1,24 +1,49 @@
 from ..session import sagemaker_session
 from .config import SageMakerTrainingConfig
 import os
+from aws_sagemaker_remote.util.json_read import json_converter
+import json
 from sagemaker.pytorch import PyTorch
-from .channels import standardize_channels, upload_local_channels
+from .channels import standardize_channels, upload_local_channels, process_channels, set_suffixes
 from sagemaker.utils import name_from_base
 from .iam import ensure_training_role
 from .experiment import ensure_experiment
 from ..git import git_get_tags
+from .training_inputs import build_training_inputs
 from ..tags import make_tags
 from ..s3 import get_file_type, FileType
+from sagemaker.inputs import TrainingInput
+import warnings
+from ..args import get_mode, get_s3_data_type, get_record_wrapping
+import tempfile
+from urllib.parse import urlparse
+from ..util.pipes import chunk_iterable
+from sagemaker.s3 import S3Uploader
+from sagemaker.inputs import ShuffleConfig
+from aws_sagemaker_remote.ecr.images import ecr_ensure_image, Image
+
 
 def sagemaker_training_run(
     args,
     config: SageMakerTrainingConfig,
     metrics=None
 ):
+    if os.getenv('SM_TRAINING_ENV', None):
+        warnings.warn(
+            "Trying to start a SageMaker container from a SageMaker container. Possible loop detected.")
+
     if metrics is None:
         metrics = {}
     session = sagemaker_session(
         profile_name=args.sagemaker_profile
+    )
+    image_uri = ecr_ensure_image(
+        image=Image(
+            path=args.sagemaker_training_image,
+            tag=args.sagemaker_training_image,
+            accounts=args.sagemaker_training_image.split(",")
+        ),
+        session=session.boto_session
     )
     script = args.sagemaker_script
     script = os.path.abspath(script)
@@ -34,6 +59,7 @@ def sagemaker_training_run(
         for k, v in metrics.items()
     ]
     dependencies = [getattr(args, k) for k in config.dependencies.keys()]
+    print("Dependencies: {}".format(dependencies))
 
     # checkpoint_local_path='/opt/ml/checkpoints/'
     bucket = session.default_bucket()
@@ -56,32 +82,37 @@ def sagemaker_training_run(
     hyperparameters['sagemaker-run'] = 'False'
     if args.sagemaker_checkpoint_s3 and args.sagemaker_checkpoint_s3 != 'default':
         if not args.sagemaker_checkpoint_s3.startswith('s3://'):
-            raise ValueError("--sagemaker-checkpoint-s3 must be an S3 URI (s3://...) or \"default\"")
+            raise ValueError(
+                "--sagemaker-checkpoint-s3 must be an S3 URI (s3://...) or \"default\"")
         checkpoint_s3 = args.sagemaker_checkpoint_s3
     else:
-        checkpoint_s3 =  "s3://{}/{}/checkpoints".format(bucket, job_name)
+        checkpoint_s3 = "s3://{}/{}/checkpoints".format(bucket, job_name)
     hyperparameters['checkpoint-dir'] = args.sagemaker_checkpoint_container
     if 'sagemaker-job-name' in hyperparameters:
         del hyperparameters['sagemaker-job-name']
 
-    channels = config.inputs
-    channels = {k: getattr(args, k) for k in channels.keys()}
-    channels = standardize_channels(channels=channels)
-    channels = upload_local_channels(
-        channels=channels, session=session, prefix=input_prefix)
-
     s3 = session.boto_session.client('s3')
-    for k,v in channels.items():
-        key = '{}-suffix'.format(k.replace('_','-'))
-        fileType = get_file_type(v, s3=s3)
-        if fileType == FileType.FILE:
-            hyperparameters[key] = os.path.basename(v)
-        elif fileType == FileType.FOLDER:
-            if key in hyperparameters:
-                del hyperparameters[key]
-        else:
-            raise ValueError()
+    channels = config.inputs
+    channels = process_channels(
+        channels,
+        args=args,
+        session=session,
+        prefix=input_prefix)
+    training_inputs = build_training_inputs(channels)
+    set_suffixes(
+        channels=channels,
+        session=session,
+        hyperparameters=hyperparameters
+    )
     print("Hyperparameters: {}".format(hyperparameters))
+
+    if not training_inputs:
+        training_inputs = None
+    else:
+        print("training_inputs: {}".format(list(training_inputs.keys())))
+    #import pprint
+    #pprint.pprint({k: v.config for k, v in channels.items()})
+    #env = config.env
 
     estimator = PyTorch(
         sagemaker_session=session,
@@ -90,7 +121,7 @@ def sagemaker_training_run(
         source_dir=source,
         role=training_role,
         instance_type=args.sagemaker_training_instance,
-        image_uri=args.sagemaker_training_image,
+        image_uri=image_uri,
         instance_count=1,
         framework_version='1.5.0',
         # hyperparameters=hyperparameters_from_argparse(vars(args)),
@@ -121,8 +152,19 @@ def sagemaker_training_run(
                 "If `sagemaker_trial_name` is provided, `sagemaker_experiment_name` must be provided as well")
         experiment_config = None
 
-    estimator.fit(channels, job_name=job_name,
-                  wait=args.sagemaker_wait, experiment_config=experiment_config)
+    estimator.fit(training_inputs, job_name=job_name,
+                  wait=False, experiment_config=experiment_config)
+    job = estimator.latest_training_job
+    if args.sagemaker_output_json:
+        obj = job.describe()
+        #print("Describe: {}".format(obj))
+        os.makedirs(os.path.dirname(
+            os.path.abspath(args.sagemaker_output_json)), exist_ok=True)
+        with open(args.sagemaker_output_json, 'w') as f:
+            json.dump(obj, f, default=json_converter, indent=4)
+
+    if args.sagemaker_wait:
+        job.wait(logs=True)  # args.sagemaker_logs)
     # todo:
     # use_spot_instances
     # experiment_config (dict[str, str]): Experiment management configuration.

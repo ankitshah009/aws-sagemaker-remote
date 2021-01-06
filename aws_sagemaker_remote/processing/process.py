@@ -12,10 +12,13 @@ import json
 
 import datetime
 
+from aws_sagemaker_remote.util.cli_argument import cli_argument
+from aws_sagemaker_remote.util.json_read import json_converter
+from aws_sagemaker_remote.ecr.images import Images, ecr_ensure_image, Image
 from ..session import sagemaker_session
 from .iam import ensure_processing_role
 from ..args import variable_to_argparse, get_local_path, PathArgument
-from .args import PROCESSING_INSTANCE, PROCESSING_IMAGE, PROCESSING_JOB_NAME, PROCESSING_RUNTIME_SECONDS, INPUT_MOUNT, OUTPUT_MOUNT, MODULE_MOUNT
+from .args import PROCESSING_INSTANCE, PROCESSING_JOB_NAME, PROCESSING_RUNTIME_SECONDS, INPUT_MOUNT, OUTPUT_MOUNT, MODULE_MOUNT
 from .config import SageMakerProcessingConfig
 from .args import sagemaker_processing_args
 from ..git import git_get_tags
@@ -33,7 +36,7 @@ def sagemaker_processing_run(args, config):
 
     inputs = {
         k: PathArgument(
-            local=getattr(args, k),
+            local=cli_argument(getattr(args, k), session=session),
             optional=v.optional,
             mode=getattr(args, "{}_mode".format(k) or v.mode or 'File')
         ) for k, v in config.inputs.items()
@@ -46,8 +49,9 @@ def sagemaker_processing_run(args, config):
     }
     outputs = {
         k: PathArgument(
-            local=getattr(args, k),
-            remote=getattr(args, "{}_s3".format(k)),
+            local=cli_argument(getattr(args, k), session=session),
+            remote=cli_argument(
+                getattr(args, "{}_s3".format(k)), session=session),
             optional=v.optional,
             mode=getattr(args, "{}_mode".format(k) or v.mode or 'EndOfJob')
         ) for k, v in config.outputs.items()
@@ -72,6 +76,8 @@ def sagemaker_processing_run(args, config):
         role=args.sagemaker_role,
         script=script,
         image=args.sagemaker_image,
+        image_path=args.sagemaker_image_path,
+        image_accounts=args.sagemaker_image_accounts,
         instance=args.sagemaker_instance,
         base_job_name=args.sagemaker_base_job_name,
         job_name=args.sagemaker_job_name,
@@ -90,7 +96,8 @@ def sagemaker_processing_run(args, config):
         configuration_command=args.sagemaker_configuration_command,
         wait=args.sagemaker_wait,
         tags=tags,
-        output_json=args.sagemaker_output_json
+        output_json=args.sagemaker_output_json,
+        env=config.env
     )
 
 
@@ -168,13 +175,6 @@ def make_processing_input(mount, name, source, s3, mode=None):
     return processing_input, path_argument
 
 
-def json_converter(o):
-    if isinstance(o, datetime.datetime):
-        return o.isoformat()  # __str__()
-    else:
-        raise ValueError("unknown: {}".format(o))
-
-
 def process(
     session: SagemakerSession,
     role,
@@ -188,7 +188,9 @@ def process(
     configuration_command=None,
     base_job_name=PROCESSING_JOB_NAME,
     job_name=None,
-    image=PROCESSING_IMAGE,
+    image=Images.PROCESSING.tag,
+    image_path=Images.PROCESSING.path,
+    image_accounts=",".join(Images.PROCESSING.accounts),
     instance=PROCESSING_INSTANCE,
     volume_size=30,
     runtime_seconds=PROCESSING_RUNTIME_SECONDS,
@@ -200,9 +202,19 @@ def process(
     logs=True,
     arguments=None,
     tags=None,
-    output_json=None
+    output_json=None,
+    env=None
 ):
     iam = session.boto_session.client('iam')
+
+    image_uri = ecr_ensure_image(
+        image=Image(
+            path=image_path,
+            tag=image,
+            accounts=image_accounts.split(",")
+        ),
+        session=session.boto_session
+    )
     role = ensure_processing_role(iam=iam, role_name=role)
     if inputs is None:
         inputs = {}
@@ -258,11 +270,16 @@ def process(
             # s3_compression_type='None'
         )
     )
-    env = {
+    if env:
+        env = env.copy()
+    else:
+        env = {}
+    env.update({
         "AWS_SAGEMAKER_REMOTE_MODULE_MOUNT": module_mount,
         "AWS_SAGEMAKER_REMOTE_PYTHON": python,
-        "AWS_SAGEMAKER_REMOTE_SCRIPT": script_remote
-    }
+        "AWS_SAGEMAKER_REMOTE_SCRIPT": script_remote,
+        "IS_SAGEMAKER": "1"
+    })
 
     if requirements:
         requirements_remote = "{}/requirements_txt/{}".format(
@@ -299,7 +316,7 @@ def process(
     print("Tags: {}".format(tags))
     processor = ScriptProcessor(
         role,
-        image_uri=image,
+        image_uri=image_uri,
         instance_count=1,
         instance_type=instance,
         command=command,
@@ -351,7 +368,7 @@ def process(
     job = processor.latest_job
     if output_json:
         obj = job.describe()
-        print("Describe: {}".format(obj))
+        #print("Describe: {}".format(obj))
         os.makedirs(os.path.dirname(
             os.path.abspath(output_json)), exist_ok=True)
         with open(output_json, 'w') as f:
